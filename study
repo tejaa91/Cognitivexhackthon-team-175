@@ -1,0 +1,293 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+import fitz  # PyMuPDF
+from sentence_transformers import SentenceTransformer, util
+import textwrap
+
+# transformers pipeline will be initialized lazily
+try:
+    from transformers import pipeline
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    pipeline = None
+    TRANSFORMERS_AVAILABLE = False
+
+# ------------------------------
+# Models & helpers
+# ------------------------------
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+_explainer = None
+_summarizer = None
+
+def _init_explainer():
+    """Load local text generator (tries flan-t5-large, then flan-t5-base)."""
+    global _explainer
+    if _explainer is None:
+        if not TRANSFORMERS_AVAILABLE:
+            return None
+        for model_name in ("google/flan-t5-large", "google/flan-t5-base"):
+            try:
+                _explainer = pipeline("text2text-generation", model=model_name)
+                print(f"[Info] Explainer loaded: {model_name}")
+                break
+            except Exception:
+                _explainer = None
+    return _explainer
+
+def _init_summarizer():
+    global _summarizer
+    if _summarizer is None and TRANSFORMERS_AVAILABLE:
+        try:
+            _summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        except Exception:
+            _summarizer = None
+    return _summarizer
+
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    doc = fitz.open(pdf_path)
+    for page in doc:
+        try:
+            page_text = page.get_text()
+            if page_text:
+                text += page_text + "\n"
+        except Exception:
+            continue
+    return text
+
+def chunk_text_by_words(text, chunk_size=450, overlap=75):
+    words = text.split()
+    if not words:
+        return []
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = start + chunk_size
+        chunk = " ".join(words[start:end]).strip()
+        if len(chunk) > 20:
+            chunks.append(chunk)
+        start += chunk_size - overlap
+    return chunks
+
+def safe_wrap(s, width=100):
+    return "\n".join(textwrap.wrap(s, width=width))
+
+# ------------------------------
+# App
+# ------------------------------
+class StudyMateApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("📘 StudyMate")
+        self.root.geometry("850x700")
+
+        self.pdf_text = ""
+        self.chunks = []
+        self.chunk_embeddings = None
+        self.ai_mode = False  # <-- New toggle
+
+        self.build_splash_page()
+
+    # -------- Splash --------
+    def build_splash_page(self):
+        self.clear_window()
+        self.root.configure(bg="#ffe0b2")
+
+        splash_label = tk.Label(
+            self.root, text="✨ DataStars Presents ✨",
+            font=("Lucida Handwriting", 42, "bold"), bg="#ffe0b2", fg="#d32f2f"
+        )
+        splash_label.pack(pady=150)
+
+        enter_btn = tk.Button(
+            self.root, text="Enter 🚀", font=("Arial", 20, "bold"),
+            bg="#1976d2", fg="white", padx=25, pady=10,
+            command=self.build_welcome_page
+        )
+        enter_btn.pack()
+
+    # -------- Welcome --------
+    def build_welcome_page(self):
+        self.clear_window()
+        self.root.configure(bg="#e1f5fe")
+
+        logo = tk.Label(
+            self.root, text="📘 StudyMate",
+            font=("Lucida Handwriting", 36, "bold"),
+            bg="#e1f5fe", fg="#0d47a1"
+        )
+        logo.pack(pady=60)
+
+        subtitle = tk.Label(
+            self.root, text="Your Smart PDF Study Assistant",
+            font=("Arial", 16, "italic"),
+            bg="#e1f5fe", fg="#00796b"
+        )
+        subtitle.pack(pady=10)
+
+        enter_button = tk.Button(
+            self.root, text="Start Learning 🚀", font=("Arial", 18, "bold"),
+            bg="#388e3c", fg="white", padx=20, pady=10,
+            command=self.build_main_page
+        )
+        enter_button.pack(pady=40)
+
+    # -------- Main Page --------
+    def build_main_page(self):
+        self.clear_window()
+        self.root.configure(bg="#ffffff")
+
+        top_frame = tk.Frame(self.root, bg="#bbdefb")
+        top_frame.pack(fill="x")
+
+        back_btn = tk.Button(top_frame, text="⬅ Back", font=("Arial", 12),
+                             bg="#ef5350", fg="white", command=self.build_welcome_page)
+        back_btn.pack(side="left", padx=8, pady=8)
+
+        title = tk.Label(top_frame, text="StudyMate", font=("Lucida Handwriting", 24, "bold"),
+                         bg="#bbdefb", fg="#1a237e")
+        title.pack(side="left", padx=20, pady=8)
+
+        # Toggle AI Mode button
+        self.ai_btn = tk.Button(top_frame, text="🤖 AI Mode: OFF", font=("Arial", 12, "bold"),
+                                bg="#9e9e9e", fg="white", command=self.toggle_ai_mode)
+        self.ai_btn.pack(side="right", padx=8, pady=8)
+
+        btn_frame = tk.Frame(self.root, bg="#ffffff")
+        btn_frame.pack(pady=15)
+
+        self.upload_btn = tk.Button(btn_frame, text="📂 Upload PDF", font=("Arial", 14, "bold"),
+                                    bg="#1976d2", fg="white", command=self.upload_pdf)
+        self.upload_btn.grid(row=0, column=0, padx=10)
+
+        self.summarize_btn = tk.Button(btn_frame, text="📝 Summarize", font=("Arial", 14, "bold"),
+                                       bg="#fbc02d", fg="black", command=self.summarize_pdf)
+        self.summarize_btn.grid(row=0, column=1, padx=10)
+
+        self.save_btn = tk.Button(btn_frame, text="💾 Save Notes", font=("Arial", 14, "bold"),
+                                  bg="#455a64", fg="white", command=self.save_notes)
+        self.save_btn.grid(row=0, column=2, padx=10)
+
+        self.chat_display = scrolledtext.ScrolledText(
+            self.root, wrap=tk.WORD, width=95, height=25, font=("Arial", 12)
+        )
+        self.chat_display.pack(pady=15)
+        self.chat_display.config(state=tk.DISABLED)
+
+        bottom_frame = tk.Frame(self.root, bg="#ffffff")
+        bottom_frame.pack(pady=10)
+
+        self.question_entry = tk.Entry(bottom_frame, font=("Arial", 14), width=50)
+        self.question_entry.pack(side=tk.LEFT, padx=10)
+
+        self.ask_button = tk.Button(bottom_frame, text="Ask ❓", font=("Arial", 14, "bold"),
+                                    bg="#4caf50", fg="white", command=self.ask_question)
+        self.ask_button.pack(side=tk.LEFT, padx=5)
+
+    # -------- Toggle AI Mode --------
+    def toggle_ai_mode(self):
+        self.ai_mode = not self.ai_mode
+        if self.ai_mode:
+            self.ai_btn.config(text="🤖 AI Mode: ON", bg="#4caf50")
+        else:
+            self.ai_btn.config(text="🤖 AI Mode: OFF", bg="#9e9e9e")
+
+    # -------- Upload --------
+    def upload_pdf(self):
+        file_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        if not file_path:
+            return
+        text = extract_text_from_pdf(file_path)
+        if not text.strip():
+            messagebox.showerror("Error", "No extractable text found in this PDF.")
+            return
+        self.pdf_text = text
+        self.chunks = chunk_text_by_words(self.pdf_text, chunk_size=450, overlap=100)
+        try:
+            self.chunk_embeddings = embedder.encode(self.chunks, convert_to_tensor=True)
+        except Exception:
+            self.chunk_embeddings = embedder.encode(self.chunks)
+        messagebox.showinfo("PDF Loaded", f"Extracted {len(self.pdf_text)} characters into {len(self.chunks)} chunks!")
+
+    # -------- Summarize (modified to show chunks only) --------
+    def summarize_pdf(self):
+        if not self.pdf_text.strip():
+            messagebox.showwarning("No PDF", "Please upload a PDF first!")
+            return
+        if not self.chunks:
+            messagebox.showwarning("No Chunks", "No chunks available. Try re-uploading the PDF.")
+            return
+
+        # Just display all chunks instead of summarizing
+        self._append_to_chat("\n📑 Extracted Chunks:\n")
+        for i, chunk in enumerate(self.chunks, 1):
+            self._append_to_chat(f"\n--- Chunk {i} ---\n{safe_wrap(chunk, 120)}\n")
+
+    # -------- Ask Question --------
+    def ask_question(self):
+        question = self.question_entry.get().strip()
+        if not question:
+            return
+        if not self.chunks:
+            messagebox.showwarning("No PDF", "Please upload a PDF first!")
+            return
+
+        self._append_to_chat(f"\nYou: {question}\n")
+
+        q_emb = embedder.encode(question, convert_to_tensor=True)
+        hits = util.semantic_search(q_emb, self.chunk_embeddings, top_k=3)[0]
+        top_chunks = [(h["corpus_id"], self.chunks[h["corpus_id"]]) for h in hits]
+
+        context_text = "\n\n".join(f"[{i}] {chunk[:1200]}" for i, (_, chunk) in enumerate(top_chunks, 1))
+        prompt = (
+            "You are a clear, patient tutor. Use the provided context to answer fully.\n\n"
+            f"Context:\n{context_text}\n\n"
+            f"Question: {question}\n\n"
+            "Answer in 300-500 words with explanation in simple, natural language."
+        )
+
+        if self.ai_mode:
+            expl = _init_explainer()
+            try:
+                out = expl(prompt, max_length=900, do_sample=False)
+                answer = out[0].get("generated_text") or str(out[0])
+            except Exception as e:
+                answer = f"⚠️ AI Mode failed: {e}"
+        else:
+            # fallback basic answer: best chunk
+            answer = top_chunks[0][1][:800]
+
+        self._append_to_chat(f"📝 Answer:\n{safe_wrap(answer, 120)}\n")
+        self.question_entry.delete(0, tk.END)
+
+    # -------- Save --------
+    def save_notes(self):
+        notes = self.chat_display.get("1.0", tk.END).strip()
+        if not notes:
+            messagebox.showwarning("No Notes", "No notes to save!")
+            return
+        file_path = filedialog.asksaveasfilename(defaultextension=".txt",
+                                                 filetypes=[("Text Files", "*.txt")])
+        if file_path:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(notes)
+            messagebox.showinfo("Saved", f"Notes saved to {file_path}")
+
+    # -------- Helpers --------
+    def _append_to_chat(self, text):
+        self.chat_display.config(state=tk.NORMAL)
+        self.chat_display.insert(tk.END, text + "\n")
+        self.chat_display.config(state=tk.DISABLED)
+        self.chat_display.yview(tk.END)
+
+    def clear_window(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+
+# ------------------------------
+# Run
+# ------------------------------
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = StudyMateApp(root)
+    root.mainloop()
